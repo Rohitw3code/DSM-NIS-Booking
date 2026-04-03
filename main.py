@@ -54,6 +54,7 @@ from read_vendor_master_data import read_vendor_data
 from nis_booking             import book_nis
 from add_new_row_data_nis    import add_incremental_week_row
 from sap_automation          import run_sap_automation
+from pdf_merger              import merge_pdfs
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -553,13 +554,18 @@ def _step_sap_automation(
     abs_amount:  float,
     vendor_data: dict,
     booking_dir: str = "",
-):
+) -> str:
+    """
+    Run SAP automation for one negative field.
+    Returns the absolute path of the checklist PDF moved into booking_dir,
+    or "" if no PDF was produced / moved.
+    """
     step  = db.step_sap(field_key)
     label = next(lbl for k, lbl in SPV_AMOUNT_FIELDS if k == field_key)
 
     if db.is_step_done(run_id, step):
         print(f"  [RESUME] {step} already done")
-        return
+        return ""
 
     # ── Guard: already exhausted retries in a previous session ───────────────
     retry_count = db.get_step_retry_count(run_id, step)
@@ -600,9 +606,11 @@ def _step_sap_automation(
             # run_sap_automation returns (checklist_number, renamed_pdf_path)
             sap_checklist_number = ""
             sap_pdf_name         = ""
+            sap_pdf_full_path    = ""
             if isinstance(sap_result, tuple) and len(sap_result) >= 2:
                 sap_checklist_number = str(sap_result[0] or "")
-                sap_pdf_name         = str(Path(sap_result[1]).name) if sap_result[1] else ""
+                sap_pdf_full_path    = str(sap_result[1] or "")
+                sap_pdf_name         = str(Path(sap_pdf_full_path).name) if sap_pdf_full_path else ""
             elif isinstance(sap_result, str):
                 sap_checklist_number = sap_result or ""
 
@@ -610,19 +618,16 @@ def _step_sap_automation(
                 db.save_checklist_value(run_id, sap_checklist_number)
                 print(f"  [DB] SAP checklist number saved: {sap_checklist_number}")
             if sap_pdf_name:
-                # Save only the PDF filename (not the blob) as requested
                 db._update_run(run_id, {"checklist_pdf_name": sap_pdf_name})
                 print(f"  [DB] SAP checklist PDF name saved: {sap_pdf_name}")
 
             # ── Move SAP checklist PDF into the booking folder ────────────────
-            sap_pdf_full_path = ""
-            if isinstance(sap_result, tuple) and len(sap_result) >= 2:
-                sap_pdf_full_path = str(sap_result[1] or "")
-
+            checklist_in_booking = ""
             if booking_dir and sap_pdf_full_path and os.path.isfile(sap_pdf_full_path):
                 dst = os.path.join(booking_dir, os.path.basename(sap_pdf_full_path))
                 try:
                     shutil.move(sap_pdf_full_path, dst)
+                    checklist_in_booking = dst
                     print(f"  [BOOKING] Moved SAP checklist PDF → {dst}")
                 except Exception as mv_exc:
                     print(f"  [WARN] Could not move SAP checklist PDF to booking folder: {mv_exc}")
@@ -636,7 +641,7 @@ def _step_sap_automation(
                 ),
             )
             print(f"  ✅ SAP done  [{label}]")
-            return  # ← success: exit retry loop
+            return checklist_in_booking  # ← success: path of PDF in booking dir
 
         except Exception as exc:
             err_str = str(exc)
@@ -691,6 +696,73 @@ def _step_update_tracker(
     except Exception as exc:
         db.step_failed(run_id, step, str(exc))
         raise
+
+
+def _merge_sap_booking_pdfs(run_id: int, booking_dir: str, sap_checklist_pdfs: list):
+    """
+    Merge email.pdf + sap_checklist_pdfs + remaining DSM PDFs found in
+    booking_dir into upload_sap_charges.pdf. Registers the merged filename
+    in the DB via db.save_merged_sap_pdf_name.
+
+    The merge order is:
+      1. email.pdf (if present)
+      2. SAP checklist PDFs (in the order provided)
+      3. any remaining PDF files in booking_dir (typically DSM attachments)
+
+    Returns the path to the merged PDF or empty string on failure.
+    """
+    try:
+        if not booking_dir or not os.path.isdir(booking_dir):
+            print("  [PDF-MERGE] No booking folder available – skipping merge")
+            return ""
+
+        files_to_merge = []
+        email_pdf = os.path.join(booking_dir, "email.pdf")
+        if os.path.isfile(email_pdf):
+            files_to_merge.append(email_pdf)
+
+        # Add SAP checklists (use provided paths if they exist, otherwise try basenames in booking_dir)
+        added = set(files_to_merge)
+        for p in sap_checklist_pdfs or []:
+            if not p:
+                continue
+            if os.path.isabs(p) and os.path.isfile(p):
+                files_to_merge.append(p)
+                added.add(os.path.abspath(p))
+            else:
+                candidate = os.path.join(booking_dir, os.path.basename(p))
+                if os.path.isfile(candidate) and os.path.abspath(candidate) not in added:
+                    files_to_merge.append(candidate)
+                    added.add(os.path.abspath(candidate))
+
+        # Add any remaining PDFs in booking_dir that were not included yet
+        for fname in sorted(os.listdir(booking_dir)):
+            if not fname.lower().endswith('.pdf'):
+                continue
+            full = os.path.join(booking_dir, fname)
+            if os.path.abspath(full) in added:
+                continue
+            if fname == 'upload_sap_charges.pdf':
+                continue
+            files_to_merge.append(full)
+            added.add(os.path.abspath(full))
+
+        if not files_to_merge:
+            print("  [PDF-MERGE] No PDF files found to merge in booking folder")
+            return ""
+
+        out_path = os.path.join(booking_dir, "upload_sap_charges.pdf")
+        try:
+            merge_pdfs(files_to_merge, out_path)
+            db.save_merged_sap_pdf_name(run_id, os.path.basename(out_path))
+            print(f"  [PDF-MERGE] Merged PDF saved: {out_path}")
+            return out_path
+        except Exception as exc:
+            print(f"  [PDF-MERGE] Failed to merge PDFs: {exc}")
+            return ""
+    except Exception as exc:
+        print(f"  [PDF-MERGE] Unexpected error: {exc}")
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -776,11 +848,29 @@ def run_pipeline(run_id: int, email_result: dict = None):
             )
 
             # ── STEP 6: SAP automation (per negative field) ───────────────
+            sap_checklist_pdfs = []        # collect all checklist PDFs
             if negative:
                 print(f"\n  ── SAP automation for {list(negative.keys())} ──")
                 for field_key, abs_amount in negative.items():
-                    _step_sap_automation(run_id, field_key, abs_amount,
-                                        vendor_data, booking_dir=booking_folder)
+                    pdf_path = _step_sap_automation(
+                        run_id, field_key, abs_amount,
+                        vendor_data, booking_dir=booking_folder,
+                    )
+                    if pdf_path:
+                        sap_checklist_pdfs.append(pdf_path)
+
+                # ── Save all SAP checklist PDF names to DB ────────────────
+                sap_pdf_basenames = [os.path.basename(p) for p in sap_checklist_pdfs]
+                if sap_pdf_basenames:
+                    db.save_sap_checklist_pdf_names(run_id, sap_pdf_basenames)
+
+                # ── Merge: email.pdf + SAP checklists + DSM PDFs → upload_sap_charges.pdf ──
+                if booking_folder and sap_checklist_pdfs:
+                    _merge_sap_booking_pdfs(
+                        run_id      = run_id,
+                        booking_dir = booking_folder,
+                        sap_checklist_pdfs = sap_checklist_pdfs,
+                    )
             else:
                 # Ensure any pre-seeded sap steps are marked skipped
                 for field_key, _ in SPV_AMOUNT_FIELDS:
@@ -810,6 +900,9 @@ def run_pipeline(run_id: int, email_result: dict = None):
 
             # ── STEP 8: update Excel tracker ──────────────────────────────
             _step_update_tracker(run_id, metadata_row, spv_row, spv_name)
+
+        # After processing SPV rows, if we created a booking folder and
+        # a merged SAP PDF was produced earlier it will already be saved.
 
         # ── All steps done ────────────────────────────────────────────────
         db.mark_run_done(run_id)

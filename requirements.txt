@@ -26,6 +26,9 @@ requests>=2.31.0
 # Playwright: controls the NIS Fiori Launchpad in a Chromium/Edge browser
 playwright>=1.44.0
 
+# PDF merging library
+pypdf>=3.0.0
+
 
 # ── SAP GUI Scripting (Windows-only) ─────────────────────────────────────────
 # pywin32: COM interface to SAP GUI Scripting Engine (win32com.client)

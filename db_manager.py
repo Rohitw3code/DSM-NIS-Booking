@@ -142,6 +142,10 @@ def init_db():
                 -- checklist value captured from portal confirmation screen
                 checklist_value      TEXT,   -- human-readable checklist/booking value from portal
 
+                -- SAP checklist PDFs (one per negative field)
+                sap_checklist_pdf_names TEXT, -- JSON list of all SAP checklist PDF basenames
+                merged_sap_pdf_name     TEXT, -- filename of the merged upload_sap_charges.pdf
+
                 -- housekeeping
                 created_at           TEXT NOT NULL,
                 started_at           TEXT,
@@ -172,6 +176,8 @@ def init_db():
     _migrate_add_column("downloaded_pdf_blob",  "BLOB")
     _migrate_add_column("checklist_pdf_blob",   "BLOB")
     _migrate_add_column("checklist_value",      "TEXT")
+    _migrate_add_column("sap_checklist_pdf_names", "TEXT")
+    _migrate_add_column("merged_sap_pdf_name",     "TEXT")
     _migrate_add_column("retry_count", "INTEGER NOT NULL DEFAULT 0", table="run_steps")
 
 
@@ -347,6 +353,24 @@ def save_checklist_value(run_id: int, checklist_value: str):
     """
     _update_run(run_id, {"checklist_value": str(checklist_value or "")})
     print(f"[DB] Saved checklist_value='{checklist_value}' for run_id={run_id}")
+
+
+def save_sap_checklist_pdf_names(run_id: int, pdf_names: list):
+    """
+    Persist the list of SAP checklist PDF basenames (one per negative field).
+    """
+    _update_run(run_id, {
+        "sap_checklist_pdf_names": json.dumps(pdf_names or []),
+    })
+    print(f"[DB] Saved {len(pdf_names)} SAP checklist PDF name(s) for run_id={run_id}: {pdf_names}")
+
+
+def save_merged_sap_pdf_name(run_id: int, merged_name: str):
+    """
+    Persist the filename of the merged upload_sap_charges.pdf.
+    """
+    _update_run(run_id, {"merged_sap_pdf_name": str(merged_name or "")})
+    print(f"[DB] Saved merged SAP PDF name='{merged_name}' for run_id={run_id}")
 
 
 def save_spv_name(run_id: int, spv_name: str):
