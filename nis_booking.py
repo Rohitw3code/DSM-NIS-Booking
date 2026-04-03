@@ -1916,12 +1916,31 @@ def book_nis(
             ],
         )
 
-        # Fresh context — no stored cookies required
-        context = browser.new_context(viewport=None)
-        page = context.new_page()
+        # ── Authentication mode ───────────────────────────────────────────────
+        # NIS_USE_COOKIES=true  →  load existing cookies.json (storage_state).
+        #                          Cookies are only consumed; they are NEVER
+        #                          written back by this automation.
+        # NIS_USE_COOKIES=false →  run the full password-based login flow.
+        auth_file   = AUTH_FILE
+        use_cookies = getattr(config, "NIS_USE_COOKIES", False)
 
-        # ── Full password-based login ─────────────────────────────────────────
-        _login_with_password(page)
+        if use_cookies:
+            if not Path(auth_file).exists():
+                raise FileNotFoundError(
+                    f"[Auth] NIS_USE_COOKIES is enabled but cookie file not found: {auth_file}\n"
+                    "Run loginwithpassword.py separately and save the storage_state first."
+                )
+            print(f"[Auth] Loading existing storage_state from: {auth_file}")
+            context = browser.new_context(viewport=None, storage_state=auth_file)
+            page = context.new_page()
+            print(f"[Auth] Navigating to NIS portal: {LOGIN_URL}")
+            page.goto(LOGIN_URL, wait_until="networkidle")
+        else:
+            # Fresh context — password-based login (cookies are never saved here)
+            context = browser.new_context(viewport=None)
+            page = context.new_page()
+            print("[Auth] Performing password-based login.")
+            _login_with_password(page)
 
         # Wait for the Fiori launchpad shell to be fully loaded
         page.wait_for_load_state("networkidle")
