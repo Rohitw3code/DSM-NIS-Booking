@@ -3,9 +3,82 @@ from pathlib import Path
 import re
 import config
 
-EDGE_PATH  = config.NIS_EDGE_PATH
-LOGIN_URL  = config.NIS_LOGIN_URL
-AUTH_FILE  = config.NIS_AUTH_FILE
+EDGE_PATH      = config.NIS_EDGE_PATH
+LOGIN_URL      = config.NIS_LOGIN_URL
+AUTH_FILE      = config.NIS_AUTH_FILE   # kept for reference / legacy
+NIS_USERNAME   = config.NIS_USERNAME
+NIS_PASSWORD   = config.NIS_PASSWORD
+NIS_OTP_SECRET = config.NIS_OTP_SECRET
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Password-based login  (replaces cookie / storage_state approach)
+# ─────────────────────────────────────────────────────────────────────────────
+def _login_with_password(page) -> None:
+    """
+    Perform the full NIS portal login flow using username + password + RSA OTP.
+
+    Mirrors the standalone loginwithpassword.py script so the same logic
+    runs inside book_nis() without needing a pre-saved cookies.json file.
+
+    Steps
+    -----
+    1. Navigate to the NIS Launchpad URL.
+    2. Enter email and click Next.
+    3. Enter password and click Sign in.
+    4. Click the 'ExternalAuth' (Approve with RSAEntraMFA) card.
+    5. Fill the OTP and click Verify.
+    6. Click the final 'Yes / Stay signed in' button.
+    """
+    print("[Login] Navigating to NIS portal …")
+    page.goto(LOGIN_URL, wait_until="networkidle")
+
+    # ── Step 1: email ────────────────────────────────────────────────────────
+    page.wait_for_selector("#i0116", state="visible", timeout=30000)
+    page.fill("#i0116", NIS_USERNAME)
+    page.click("#idSIButton9")
+    print(f"[Login] Email entered: {NIS_USERNAME}")
+
+    # ── Step 2: password ─────────────────────────────────────────────────────
+    page.wait_for_selector("#i0118", state="visible", timeout=20000)
+    page.fill("#i0118", NIS_PASSWORD)
+    page.click("#idSIButton9")
+    page.wait_for_load_state("networkidle")
+    print("[Login] Password entered.")
+
+    # ── Step 3: ExternalAuth / RSAEntraMFA card ───────────────────────────────
+    try:
+        page.wait_for_selector("div[data-value='ExternalAuth']", state="visible", timeout=20000)
+        page.click("div[data-value='ExternalAuth']")
+        print("[Login] ExternalAuth card clicked.")
+    except Exception as e:
+        print(f"[Login] ExternalAuth card not found (may have been skipped): {e}")
+
+    # ── Step 4: RSA OTP ──────────────────────────────────────────────────────
+    try:
+        page.wait_for_selector("#input_otp_secret", state="visible", timeout=20000)
+        page.fill("#input_otp_secret", NIS_OTP_SECRET)
+        page.wait_for_selector(
+            '#btn_verify_securid:not([aria-disabled="true"])',
+            state="attached",
+            timeout=10000,
+        )
+        page.click("#btn_verify_securid")
+        page.wait_for_load_state("networkidle")
+        print(f"[Login] OTP entered and submitted.")
+    except Exception as e:
+        print(f"[Login] OTP step skipped or failed: {e}")
+
+    # ── Step 5: 'Yes / Stay signed in' ───────────────────────────────────────
+    try:
+        page.wait_for_selector("#idSIButton9", state="visible", timeout=20000)
+        with page.expect_navigation(wait_until="networkidle"):
+            page.click("#idSIButton9")
+        print("[Login] 'Yes' / Stay signed-in button clicked.")
+    except Exception as e:
+        print(f"[Login] Final Yes button step skipped or failed: {e}")
+
+    print("[Login] Login flow complete — portal should now be loaded.")
 
 def open_view_create(page):
     """Navigate to the View & Create card after login."""
@@ -1689,6 +1762,127 @@ def _dismiss_add_item_popup(page, frame=None, timeout: int = 4000):
     print("[AddItemPopup] No splash popup found after Add Item — continuing.")
 
 
+def click_submit_button(page, frame, timeout: int = 20000):
+    """
+    Click the NIS 'Submit' button on the final confirmation screen.
+
+    Button HTML:
+        <button id="application-Nis-manage-component---CreateNIS--submitButton"
+                data-ui5-accesskey="s" ...>
+            <bdi id="application-Nis-manage-component---CreateNIS--submitButton-BDI-content">
+                Submit
+            </bdi>
+        </button>
+
+    Strategies tried in order (most specific → most generic):
+      1. Exact element ID (most stable when the component id is fixed)
+      2. SAP accesskey="s" attribute
+      3. ARIA role + exact name "Submit"
+      4. CSS :has(bdi) text match
+      5. Generic has-text fallback
+      6. JavaScript document walk across all iframe documents (last resort)
+    """
+    iframe_selector = (
+        "iframe[id^='application-Nis-manage-'], "
+        "iframe[name^='application-Nis-manage-'], "
+        "iframe[src*='Nis-manage']"
+    )
+
+    SUBMIT_ID = "application-Nis-manage-component---CreateNIS--submitButton"
+
+    def _attempt(scope, label: str) -> bool:
+        strategies = [
+            # 1) Exact element ID
+            lambda s: s.locator(f"#{SUBMIT_ID}"),
+            # 2) SAP accesskey attribute
+            lambda s: s.locator("button[data-ui5-accesskey='s']"),
+            # 3) ARIA role + name
+            lambda s: s.get_by_role("button", name=re.compile(r"^\s*Submit\s*$", re.I)),
+            # 4) <bdi> inner text
+            lambda s: s.locator("button:has(bdi:text-is('Submit'))"),
+            # 5) Generic has-text
+            lambda s: s.locator("button:has-text('Submit')"),
+        ]
+        for strategy in strategies:
+            try:
+                btn = strategy(scope)
+                if btn.count() == 0:
+                    continue
+                btn.first.wait_for(state="visible", timeout=timeout)
+                try:
+                    btn.first.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    btn.first.click(timeout=timeout)
+                    print(f"✅ Submit button clicked [{label}]")
+                    return True
+                except Exception:
+                    # Pointer-event blocked — JS click fallback
+                    try:
+                        btn.first.evaluate("el => el.click()")
+                        print(f"✅ Submit button clicked via JS [{label}]")
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return False
+
+    # Scope 1 — existing frame locator
+    if _attempt(frame, "existing frame locator"):
+        return
+
+    # Scope 2 — fresh frame_locator (handles iframe reload between steps)
+    try:
+        fresh_frame = page.frame_locator(iframe_selector)
+        if _attempt(fresh_frame, "fresh frame_locator"):
+            return
+    except Exception:
+        pass
+
+    # Scope 3 — JS walk across every iframe document (cross-origin safe within same app)
+    try:
+        clicked = page.evaluate(f"""
+            () => {{
+                const SUBMIT_ID = "{SUBMIT_ID}";
+                // Search in every frame document
+                const frames = [window, ...Array.from(window.frames)];
+                for (const f of frames) {{
+                    try {{
+                        let btn = f.document.getElementById(SUBMIT_ID);
+                        if (!btn) {{
+                            // Fallback: find by accesskey
+                            btn = f.document.querySelector("button[data-ui5-accesskey='s']");
+                        }}
+                        if (!btn) {{
+                            // Fallback: find by text content
+                            const allBtns = f.document.querySelectorAll("button");
+                            for (const b of allBtns) {{
+                                if (b.textContent.trim().toLowerCase() === "submit") {{
+                                    btn = b;
+                                    break;
+                                }}
+                            }}
+                        }}
+                        if (btn) {{
+                            btn.click();
+                            return true;
+                        }}
+                    }} catch (e) {{}}
+                }}
+                return false;
+            }}
+        """)
+        if clicked:
+            print("✅ Submit button clicked via JS document walk.")
+            return
+    except Exception:
+        pass
+
+    print("⚠️  Submit button not found — page may have already submitted or selector changed.")
+
+
 def book_nis(
     pdf_path: str,
     company_code: str,
@@ -1708,32 +1902,30 @@ def book_nis(
       - "revenue_diff"
       - "revenue_loss"
     """
-    if not Path(AUTH_FILE).exists():
-        raise FileNotFoundError(f"{AUTH_FILE} not found. Run the login script first to generate it.")
-
     with sync_playwright() as p:
         import time
 
         checklist_id = ""   # will be populated after final submission
         browser = p.chromium.launch(
+            executable_path=EDGE_PATH,
             headless=False,
             args=[
                 "--start-maximized",
                 "--disable-infobars",
-                "--force-device-scale-factor=1"
-            ]
+                "--force-device-scale-factor=1",
+            ],
         )
 
-        # browser = p.chromium.launch(headless=False)
-
-       # ✅ Fullscreen browser
-        context = browser.new_context(
-            storage_state=AUTH_FILE,
-            viewport=None
-        )
-
+        # Fresh context — no stored cookies required
+        context = browser.new_context(viewport=None)
         page = context.new_page()
-        page.goto(LOGIN_URL, wait_until="networkidle")
+
+        # ── Full password-based login ─────────────────────────────────────────
+        _login_with_password(page)
+
+        # Wait for the Fiori launchpad shell to be fully loaded
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(3000)
                   
         # ✅ Force website to fixed 500x500 (right & bottom free space)
         page.evaluate("""
@@ -1968,6 +2160,9 @@ def book_nis(
         page.wait_for_timeout(2000)
         _click_final_next(page, frame)
 
+        # -------- Submit the NIS booking --------
+        page.wait_for_timeout(3000)
+        click_submit_button(page, frame)
 
         # -------- Capture NIS checklist ID from confirmation screen --------
         page.wait_for_timeout(3000)
@@ -1983,20 +2178,179 @@ def book_nis(
         return checklist_id  # may be "" if capture failed
 
 
-def capture_nis_checklist_id(page, frame, timeout: int = 15000) -> str:
+def capture_nis_checklist_id(page, frame, timeout: int = 20000) -> str:
     """
-    TODO: NIS portal number capture — NOT YET IMPLEMENTED.
+    After Submit, the NIS portal shows a success MessageBox dialog:
 
-    The NIS portal number (displayed on the booking confirmation screen) has
-    not been implemented yet.  This function always returns "" so that the
-    rest of the pipeline continues without error.
+        <span class="sapMMsgBoxText">Request 7000088592 submitted successfully.</span>
 
-    When the correct selector / element for the NIS confirmation number is
-    identified, replace the body of this function with the real extraction
-    logic and update _step_nis_booking in main.py to persist the value.
+    This function:
+      1. Waits for the success dialog to appear.
+      2. Extracts the NIS booking number (the numeric part) from the message text.
+      3. Clicks the OK button to dismiss the popup.
+      4. Returns the NIS booking number as a string, or "" on failure.
 
-    Note: this number is entirely separate from the SAP checklist number,
-    which is captured by capture_checklist_data() in sap_automation.py.
+    OK button HTML (auto-generated id):
+        <button id="__mbox-btn-1" data-ui5-accesskey="o" ...>
+            <bdi>OK</bdi>
+        </button>
     """
-    print("[NIS ID] NIS portal number capture not yet implemented — returning ''")
+
+    nis_number = ""
+
+    iframe_selector = (
+        "iframe[id^='application-Nis-manage-'], "
+        "iframe[name^='application-Nis-manage-'], "
+        "iframe[src*='Nis-manage']"
+    )
+
+    # ── Helper: extract NIS number from a scope (frame locator or page) ──────
+    def _extract_and_dismiss(scope, label: str) -> str:
+        nonlocal nis_number
+
+        # --- Step 1: Find the success message text ---
+        msg_locators = [
+            # Exact class used by SAP MessageBox text
+            scope.locator(".sapMMsgBoxText"),
+            # Broader dialog text fallback
+            scope.locator("[role='dialog'] span.sapMText, [role='alertdialog'] span.sapMText"),
+            # Any visible span containing "submitted successfully"
+            scope.locator("span:has-text('submitted successfully')"),
+        ]
+
+        msg_text = ""
+        for loc in msg_locators:
+            try:
+                if loc.count() == 0:
+                    continue
+                loc.first.wait_for(state="visible", timeout=timeout)
+                msg_text = loc.first.inner_text().strip()
+                if msg_text:
+                    break
+            except Exception:
+                continue
+
+        if msg_text:
+            print(f"[NIS ID] Success message found [{label}]: {msg_text}")
+            # Extract numeric NIS booking number (e.g. 7000088592)
+            match = re.search(r'\b(\d{7,})\b', msg_text)
+            if match:
+                nis_number = match.group(1)
+                print(f"✅ NIS Booking Number captured: {nis_number}")
+            else:
+                print(f"⚠️  Could not parse NIS number from message: {msg_text}")
+        else:
+            print(f"[NIS ID] No success message text found in [{label}]")
+            return ""
+
+        # --- Step 2: Click the OK button to dismiss the popup ---
+        ok_strategies = [
+            # 1) Exact auto-generated id pattern
+            lambda s: s.locator("[id^='__mbox-btn']").filter(has_text=re.compile(r"^\s*OK\s*$", re.I)),
+            # 2) SAP accesskey="o" (the OK button carries this)
+            lambda s: s.locator("button[data-ui5-accesskey='o']"),
+            # 3) ARIA role + name
+            lambda s: s.get_by_role("button", name=re.compile(r"^\s*OK\s*$", re.I)),
+            # 4) Emphasized button with OK text inside <bdi>
+            lambda s: s.locator("button.sapMBtnEmphasized:has(bdi:text-is('OK'))"),
+            # 5) Generic has-text fallback
+            lambda s: s.locator("button:has-text('OK')"),
+        ]
+
+        for strategy in ok_strategies:
+            try:
+                btn = strategy(scope)
+                if btn.count() == 0:
+                    continue
+                btn.first.wait_for(state="visible", timeout=8000)
+                try:
+                    btn.first.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    btn.first.click(timeout=5000)
+                    print(f"✅ OK button clicked — success popup dismissed [{label}]")
+                    return nis_number
+                except Exception:
+                    try:
+                        btn.first.evaluate("el => el.click()")
+                        print(f"✅ OK button clicked via JS — success popup dismissed [{label}]")
+                        return nis_number
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+        print(f"⚠️  OK button not found in [{label}] — popup may auto-dismiss")
+        return nis_number
+
+    # ── Scope 1: existing frame locator ──────────────────────────────────────
+    result = _extract_and_dismiss(frame, "existing frame locator")
+    if result:
+        return result
+
+    # ── Scope 2: fresh frame_locator ─────────────────────────────────────────
+    try:
+        fresh_frame = page.frame_locator(iframe_selector)
+        result = _extract_and_dismiss(fresh_frame, "fresh frame_locator")
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # ── Scope 3: #sap-ui-static overlay (popups sometimes live here) ────────
+    try:
+        static_layer = page.locator("#sap-ui-static")
+        if static_layer.count() > 0:
+            result = _extract_and_dismiss(static_layer, "#sap-ui-static")
+            if result:
+                return result
+    except Exception:
+        pass
+
+    # ── Scope 4: top-level page ──────────────────────────────────────────────
+    result = _extract_and_dismiss(page, "top-level page")
+    if result:
+        return result
+
+    # ── Scope 5: JS walk across all frames (last resort) ────────────────────
+    try:
+        js_result = page.evaluate("""
+            () => {
+                const frames = [window, ...Array.from(window.frames)];
+                for (const f of frames) {
+                    try {
+                        // Find the message text
+                        const msgEl = f.document.querySelector('.sapMMsgBoxText')
+                                   || f.document.querySelector('[role="dialog"] span.sapMText');
+                        if (!msgEl) continue;
+                        const text = msgEl.textContent.trim();
+                        const match = text.match(/\\b(\\d{7,})\\b/);
+                        const nisNum = match ? match[1] : '';
+
+                        // Click OK
+                        const okBtns = f.document.querySelectorAll("button[data-ui5-accesskey='o'], button[id^='__mbox-btn']");
+                        for (const btn of okBtns) {
+                            if (btn.textContent.trim().toLowerCase().includes('ok')) {
+                                btn.click();
+                                break;
+                            }
+                        }
+                        return nisNum;
+                    } catch (e) {}
+                }
+                return '';
+            }
+        """)
+        if js_result:
+            nis_number = js_result
+            print(f"✅ NIS Booking Number captured via JS walk: {nis_number}")
+            return nis_number
+    except Exception:
+        pass
+
+    if nis_number:
+        return nis_number
+
+    print("⚠️  NIS booking number could not be captured from the success popup.")
     return ""

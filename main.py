@@ -399,11 +399,7 @@ def _step_nis_booking(
             print(f"\n  ▶ NIS booking  [{label}]  amount={amount}"
                   f"  (attempt {current_attempt}/{MAX_STEP_RETRIES})")
 
-            # NOTE: NIS portal number capture is not yet implemented.
-            # book_nis() returns an empty string for now — the return value
-            # is intentionally not used here.  When NIS number capture is
-            # added to nis_booking.py this step will be updated accordingly.
-            book_nis(
+            nis_number = book_nis(
                 pdf_path     = pdf_path,
                 company_code = company_code,
                 vendor_code  = vendor_code,
@@ -415,17 +411,22 @@ def _step_nis_booking(
                 svp_dsm_row  = nis_row,
             )
 
+            # ── Persist the NIS booking number captured from the portal ───────
+            if nis_number:
+                db.save_nis_checklist_id(run_id, nis_number)
+                print(f"  [DB] NIS booking number saved: {nis_number}")
+            else:
+                print("  [WARN] NIS booking number was not captured from the portal.")
+
             # ── Persist the email attachment PDF blob ─────────────────────────
-            # (checklist_pdf_name is left blank — the NIS number needed to
-            #  build a meaningful name is not yet available from the portal)
             db.save_downloaded_pdfs(run_id, pdf_files, checklist_pdf_name="")
 
             db.step_done(
                 run_id, step,
                 detail=f"amount={amount}  attempts={current_attempt}"
-                       f"  nis_number=pending_implementation",
+                       f"  nis_number={nis_number or 'not_captured'}",
             )
-            print(f"  ✅ NIS done  [{label}]  (NIS portal number: not yet captured)")
+            print(f"  ✅ NIS done  [{label}]  NIS booking number: {nis_number or '(not captured)'}")
             return  # ← success: exit retry loop
 
         except Exception as exc:
