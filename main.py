@@ -36,6 +36,8 @@ python main.py --mode immediate --lookback 2
 
 import argparse
 import json
+import os
+import shutil
 import time
 import traceback
 from datetime import datetime
@@ -155,6 +157,97 @@ def normalize_vendor_data(raw: dict) -> dict:
 
 def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Booking folder  –  save email artefacts after successful extraction
+# ─────────────────────────────────────────────────────────────────────────────
+BOOKING_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "booking")
+
+
+def _has_all_extracted_values(metadata_row: dict, spv_dsm_rows: list) -> bool:
+    """
+    Return True only when the extraction produced ALL the values we care about:
+      • metadata: week_no, from_date, to_date, due_date
+      • spv_dsm : at least one row with a non-empty spv_name
+    """
+    for field in ("week_no", "from_date", "to_date", "due_date"):
+        if not str(metadata_row.get(field, "")).strip():
+            return False
+    if not spv_dsm_rows:
+        return False
+    if not any(str(r.get("spv_name", "")).strip() for r in spv_dsm_rows):
+        return False
+    return True
+
+
+def _sanitize_folder_name(name: str) -> str:
+    """Remove or replace characters that are unsafe in directory names."""
+    # Replace path-unsafe chars with underscores, collapse whitespace
+    import re as _re
+    name = _re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = _re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def _save_email_to_booking_folder(
+    metadata_row: dict,
+    spv_dsm_rows: list,
+    body_html: str,
+    attachment_dir: str,
+    subject: str = "",
+) -> str:
+    """
+    Create  booking/<from_date> to <to_date>/  and save:
+      • email.pdf          – the email body rendered to PDF (via Playwright)
+      • all PDF files from attachment_dir (copied)
+
+    Returns the absolute path to the created booking folder,
+    or "" if the folder could not be created.
+    """
+    from_date = str(metadata_row.get("from_date", "")).strip()
+    to_date   = str(metadata_row.get("to_date",   "")).strip()
+
+    folder_name = _sanitize_folder_name(f"{from_date} to {to_date}")
+    booking_dir = os.path.join(BOOKING_ROOT, folder_name)
+    os.makedirs(booking_dir, exist_ok=True)
+
+    # ── Save email body as PDF using Playwright ───────────────────────────
+    email_pdf_path = os.path.join(booking_dir, "email.pdf")
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(body_html, wait_until="networkidle")
+            page.pdf(path=email_pdf_path, format="A4", print_background=True)
+            browser.close()
+        print(f"  [BOOKING] Saved email as PDF → {email_pdf_path}")
+    except Exception as exc:
+        print(f"  [WARN] Could not convert email to PDF: {exc}")
+        # Fallback: save as HTML so we don't lose the email content
+        html_fallback = os.path.join(booking_dir, "email.html")
+        try:
+            with open(html_fallback, "w", encoding="utf-8") as f:
+                f.write(body_html)
+            print(f"  [BOOKING] Fallback – saved email body as HTML → {html_fallback}")
+        except Exception as exc2:
+            print(f"  [WARN] Could not save email HTML fallback: {exc2}")
+
+    # ── Copy PDF attachments into the booking folder ──────────────────────
+    if attachment_dir and os.path.isdir(attachment_dir):
+        for fname in os.listdir(attachment_dir):
+            if fname.lower().endswith(".pdf"):
+                src = os.path.join(attachment_dir, fname)
+                dst = os.path.join(booking_dir, fname)
+                try:
+                    shutil.copy2(src, dst)
+                    print(f"  [BOOKING] Copied PDF → {dst}")
+                except Exception as exc:
+                    print(f"  [WARN] Could not copy {fname}: {exc}")
+
+    print(f"  [BOOKING] Folder created: {booking_dir}")
+    return booking_dir
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,6 +552,7 @@ def _step_sap_automation(
     field_key:   str,
     abs_amount:  float,
     vendor_data: dict,
+    booking_dir: str = "",
 ):
     step  = db.step_sap(field_key)
     label = next(lbl for k, lbl in SPV_AMOUNT_FIELDS if k == field_key)
@@ -519,6 +613,19 @@ def _step_sap_automation(
                 # Save only the PDF filename (not the blob) as requested
                 db._update_run(run_id, {"checklist_pdf_name": sap_pdf_name})
                 print(f"  [DB] SAP checklist PDF name saved: {sap_pdf_name}")
+
+            # ── Move SAP checklist PDF into the booking folder ────────────────
+            sap_pdf_full_path = ""
+            if isinstance(sap_result, tuple) and len(sap_result) >= 2:
+                sap_pdf_full_path = str(sap_result[1] or "")
+
+            if booking_dir and sap_pdf_full_path and os.path.isfile(sap_pdf_full_path):
+                dst = os.path.join(booking_dir, os.path.basename(sap_pdf_full_path))
+                try:
+                    shutil.move(sap_pdf_full_path, dst)
+                    print(f"  [BOOKING] Moved SAP checklist PDF → {dst}")
+                except Exception as mv_exc:
+                    print(f"  [WARN] Could not move SAP checklist PDF to booking folder: {mv_exc}")
 
             db.step_done(
                 run_id, step,
@@ -626,6 +733,22 @@ def run_pipeline(run_id: int, email_result: dict = None):
         # ── STEP 2: email_extraction ──────────────────────────────────────
         metadata_row, spv_dsm_rows = _step_extraction(run_id, body_html)
 
+        # ── Save email to booking folder if ALL extracted values are present ──
+        booking_folder = ""
+        if _has_all_extracted_values(metadata_row, spv_dsm_rows):
+            booking_folder = _save_email_to_booking_folder(
+                metadata_row   = metadata_row,
+                spv_dsm_rows   = spv_dsm_rows,
+                body_html      = body_html,
+                attachment_dir = attachment_dir,
+                subject        = run.get("subject", ""),
+            )
+            # Update attachment_dir so later steps (NIS/SAP) use the booking folder
+            if booking_folder:
+                attachment_dir = booking_folder
+        else:
+            print("  [BOOKING] Skipped folder creation – not all extracted values present")
+
         # We process SPV rows one by one; most emails have exactly one
         # but the loop handles multiple SPV rows gracefully
         for spv_row in spv_dsm_rows:
@@ -656,7 +779,8 @@ def run_pipeline(run_id: int, email_result: dict = None):
             if negative:
                 print(f"\n  ── SAP automation for {list(negative.keys())} ──")
                 for field_key, abs_amount in negative.items():
-                    _step_sap_automation(run_id, field_key, abs_amount, vendor_data)
+                    _step_sap_automation(run_id, field_key, abs_amount,
+                                        vendor_data, booking_dir=booking_folder)
             else:
                 # Ensure any pre-seeded sap steps are marked skipped
                 for field_key, _ in SPV_AMOUNT_FIELDS:
